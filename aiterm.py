@@ -10,16 +10,42 @@ from textual.containers import Horizontal, Vertical
 
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
+MEMORY_FILE = "memory.json"
 BLACKLIST = [
     "shutdown", "reboot", "poweroff", "rm -rf", "mkfs",
     "dd if=", ":(){ :|:& };:", "halt", "init 0"
 ]
+
+INTERACTIVE_PROGRAMS = [
+    "cmatrix", "vim", "nano", "htop", "top", "ssh", "tmux",
+    "screen", "python3", "bash", "zsh", "fish", "mc", "ranger"
+]
+
+def load_memory():
+    if os.path.exists(MEMORY_FILE):
+        try:
+            with open(MEMORY_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return []
+    return []
+
+def save_memory(history):
+    try:
+        with open(MEMORY_FILE, "w") as f:
+            json.dump(history[-40:], f)
+    except:
+        pass
 
 def is_dangerous(command):
     for term in BLACKLIST:
         if term in command.lower():
             return True
     return False
+
+def is_interactive(command):
+    first_word = command.strip().split()[0] if command.strip() else ""
+    return first_word in INTERACTIVE_PROGRAMS
 
 def clean_json(raw):
     raw = re.sub(r"```json", "", raw)
@@ -30,20 +56,26 @@ def clean_json(raw):
         return match.group(0)
     return raw
 
-def ask_groq_casual(user_goal):
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": """You are a casual friendly Kali Linux AI agent.
+def ask_groq_casual(user_goal, history):
+    messages = [
+        {"role": "system", "content": """You are a casual friendly Kali Linux AI agent with memory.
+You remember everything the user has told you in this conversation.
 Return ONLY raw JSON, no markdown, no backticks, no explanation outside JSON.
 Format:
-{"reply": "casual 1-2 sentence reply", "commands": ["cmd1", "cmd2"]}
+{"reply": "casual 1-2 sentence reply referencing context if relevant", "commands": ["cmd1", "cmd2"]}
 Rules:
 - Always append -y to apt commands
 - If not possible via terminal, explain in reply and return empty commands array
-- Keep reply short and casual"""},
-            {"role": "user", "content": user_goal}
-        ]
+- Keep reply short and casual like texting a friend
+- If user asks about previous conversation, reference it in reply
+- If no commands needed for a casual question, return empty commands array"""}
+    ]
+    messages += history[-20:]
+    messages.append({"role": "user", "content": user_goal})
+
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=messages
     )
     raw = response.choices[0].message.content.strip()
     raw = clean_json(raw)
@@ -51,7 +83,7 @@ Rules:
         data = json.loads(raw)
         return data.get("reply", "On it!"), data.get("commands", [])
     except:
-        return "On it!", []
+        return raw, []
 
 def ask_groq_fix(command, error):
     response = client.chat.completions.create(
@@ -146,6 +178,10 @@ class AITerminal(App):
     }
     """
 
+    def __init__(self):
+        super().__init__()
+        self.history = load_memory()
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal():
@@ -164,8 +200,10 @@ class AITerminal(App):
         chat_log = self.query_one("#chat_log", RichLog)
         terminal_log = self.query_one("#terminal_log", RichLog)
         chat_log.write("[bold #00bfff]hey! kali ai agent here[/bold #00bfff]")
-        chat_log.write("[#888888]tell me what you wanna do in plain english[/#888888]")
-        chat_log.write("[#888888]i'll plan and run everything for you[/#888888]")
+        if self.history:
+            chat_log.write(f"[#888888]i remember our last {len(self.history)} messages[/#888888]")
+        else:
+            chat_log.write("[#888888]tell me what you wanna do in plain english[/#888888]")
         chat_log.write("[#888888]──────────────────────────────────────[/#888888]")
         terminal_log.write("[bold #00ff41]terminal ready[/bold #00ff41]")
         terminal_log.write("[#888888]type raw bash commands directly here[/#888888]")
@@ -180,8 +218,14 @@ class AITerminal(App):
             self.call_from_thread(status.update, f"running step {i+1} of {len(commands)}...")
 
             if is_dangerous(command):
-                self.call_from_thread(chat_log.write, f"[bold red]blocked that one — too dangerous: {command}[/bold red]")
+                self.call_from_thread(chat_log.write, f"[bold red]blocked — too dangerous: {command}[/bold red]")
                 self.call_from_thread(terminal_log.write, f"[bold red]BLOCKED: {command}[/bold red]")
+                continue
+
+            if is_interactive(command):
+                self.call_from_thread(chat_log.write, f"[yellow]{command} is interactive, opening new terminal window...[/yellow]")
+                self.call_from_thread(terminal_log.write, f"[#ffff00]$ xterm -e {command}[/#ffff00]")
+                subprocess.Popen(f"xterm -e {command}", shell=True)
                 continue
 
             self.call_from_thread(terminal_log.write, f"\n[bold #ffff00]$ {command}[/bold #ffff00]")
@@ -233,7 +277,11 @@ class AITerminal(App):
             chat_log.write(f"\n[bold white]you:[/bold white] {user_goal}")
             status.update("thinking...")
 
-            reply, commands = ask_groq_casual(user_goal)
+            self.history.append({"role": "user", "content": user_goal})
+            reply, commands = ask_groq_casual(user_goal, self.history)
+            self.history.append({"role": "assistant", "content": reply})
+            save_memory(self.history)
+
             chat_log.write(f"[bold #00bfff]AI:[/bold #00bfff] {reply}")
 
             if not commands:
@@ -259,6 +307,11 @@ class AITerminal(App):
 
             if is_dangerous(command):
                 terminal_log.write(f"[bold red]BLOCKED: {command}[/bold red]")
+                return
+
+            if is_interactive(command):
+                terminal_log.write(f"[#ffff00]opening {command} in new window...[/#ffff00]")
+                subprocess.Popen(f"xterm -e {command}", shell=True)
                 return
 
             terminal_log.write(f"\n[bold #ffff00]$ {command}[/bold #ffff00]")
