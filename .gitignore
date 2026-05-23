@@ -1,2 +1,6 @@
-venv
-.env
+venv/
+memory.json
+*.elf
+payload*
+__pycache__/
+*.pyc
